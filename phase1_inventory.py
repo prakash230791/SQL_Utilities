@@ -19,24 +19,47 @@ Usage:
   python phase1_inventory.py --config config.yaml --clr dbo.Get_concatenate --clr dbo.clr_Split
   python phase1_inventory.py --config config.yaml --clr-file clr_scope.txt
   python phase1_inventory.py --config config.yaml --reanalyze output/<run_id>   # offline, no DB
+  python phase1_inventory.py --config config.yaml --from-folder impacted_procs --clr dbo.Get_concatenate \\
+         --database SAMPLEDB                                                   # offline, no DB
+
+--from-folder builds a Phase 1 run folder (inventory.json + definitions/) straight from a
+folder of proc/function/view/trigger .sql files instead of scanning a live database: schema,
+name and object type are read off each file's own CREATE/ALTER header (RETURNS decides FN vs
+IF vs TF), and ANSI_NULLS/QUOTED_IDENTIFIER are sniffed from any SET statements in the file
+(default ON/ON). Files scripted out of SSMS ("Script as CREATE") are handled directly: a leading
+SET ANSI_NULLS/QUOTED_IDENTIFIER/GO preamble and a trailing GO are trimmed so the stored
+definition matches sys.sql_modules.definition's own shape - the settings aren't lost, they're
+captured in uses_ansi_nulls/uses_quoted_identifier instead, same as a live run.
+Give the source CLR its type/arity up front with source_type/source_param_count
+on its clr_objects entry in config - without it, unqualified calls to a CLR procedure or
+table-valued function may go undetected (schema-qualified calls, the normal case, are unaffected). Add
+source_synonyms: [[schema, name], ...] for any synonym that points at it (there's no catalog to
+discover synonyms from offline). Object renames (sp_rename after the file was extracted) can't be
+detected without a catalog either - the file's own CREATE header name is trusted as current.
+Computed columns/constraints and encrypted objects aren't representable this way; use a live
+Phase 1 run for those. The output is an ordinary Phase 1 run folder - feed it to phase2_convert.py
+exactly as usual.
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import logging
+import re
 import sys
 from collections import Counter
 from pathlib import Path
 
 from clr_migrator import __version__, reporting
 from clr_migrator.analyzer import (CLR_TYPE_DESC, COMPLEXITY, Analyzer, name_parts,
-                                   overall_class)
+                                   overall_class, parse_header, referenced_names)
 from clr_migrator.common import (build_targets, mapping_for, read_sql, runtime_identity,
                                  safe_filename, sha256_text, setup_logging, stamp, utc_now,
                                  write_text)
 from clr_migrator.config import ConfigError, load_config, resolve_path, split_name
 from clr_migrator.rewriter import preview, quote_name
+from clr_migrator.tsql_lexer import Token, significant, tokenize
 
 log = logging.getLogger("phase1")
 
@@ -252,6 +275,154 @@ def collect_database(cur, db: str, scope: list[str], cfg: dict, run_dir: Path, u
     return {"targets": targets, "objects": objects, "non_module_dependencies": nonmodule}
 
 
+# ------------------------------------------------------ folder collection (offline, no DB)
+_SET_RX = re.compile(r"\bSET\s+(ANSI_NULLS|QUOTED_IDENTIFIER)\s+(ON|OFF)\b", re.IGNORECASE)
+_TRAILING_GO_RX = re.compile(r"\r?\n[ \t]*GO[ \t]*(?:\r?\n)*\Z", re.IGNORECASE)
+_HDR_TYPE = {"PROC": "P", "PROCEDURE": "P", "VIEW": "V", "TRIGGER": "TR"}
+
+
+def sniff_settings(text: str) -> tuple[bool, bool]:
+    """SET ANSI_NULLS/QUOTED_IDENTIFIER as SSMS scripts them ahead of the CREATE statement.
+    Defaults to ON/ON (SQL Server's own session defaults) when the file has neither."""
+    ansi, qi = True, True
+    for m in _SET_RX.finditer(text):
+        val = m.group(2).upper() == "ON"
+        if m.group(1).upper() == "ANSI_NULLS":
+            ansi = val
+        else:
+            qi = val
+    return ansi, qi
+
+
+def find_create_offset(sig: list[Token]) -> int | None:
+    """The character offset of the object's own CREATE/ALTER PROC/FUNCTION/VIEW/TRIGGER header,
+    skipping any leading SET ANSI_NULLS/QUOTED_IDENTIFIER/GO preamble a scripted-out file carries.
+    parse_header alone only recognizes a header at token 0, which sys.sql_modules.definition
+    always satisfies (SQL Server strips the SET statements into their own catalog columns) but a
+    file scripted out of SSMS normally does not."""
+    for i, t in enumerate(sig):
+        if t.upper in ("CREATE", "ALTER") and parse_header(sig[i:]) is not None:
+            return t.start
+    return None
+
+
+def trim_trailing_go(text: str) -> str:
+    """Drops one trailing standalone GO batch separator, matching sys.sql_modules.definition's
+    shape (it never has a trailing GO either - GO is a client-tool batch separator, not T-SQL)."""
+    return _TRAILING_GO_RX.sub("", text)
+
+
+def detect_function_subtype(sig: list[Token], name_end: int) -> str:
+    """The token right after RETURNS fixes FN (scalar) vs IF (inline TVF) vs TF (multi-statement
+    TVF): a scalar type name, the bare TABLE keyword (AS RETURN follows), or a @variable (TABLE
+    with a column list and a BEGIN...END body follows)."""
+    for i, t in enumerate(sig):
+        if t.start >= name_end and t.upper == "RETURNS":
+            nxt = sig[i + 1] if i + 1 < len(sig) else None
+            if nxt is None:
+                return "FN"
+            if nxt.kind == "VAR":
+                return "TF"
+            if nxt.upper == "TABLE":
+                return "IF"
+            return "FN"
+    return "FN"
+
+
+def header_object_type(sig: list[Token], header) -> str:
+    if header.kind == "FUNCTION":
+        return detect_function_subtype(sig, header.name_end)
+    return _HDR_TYPE[header.kind]
+
+
+def collect_from_folder(folder: Path, db: str, scope: list[str], cfg: dict, run_dir: Path,
+                        used: set) -> dict:
+    """Builds the same {targets, objects, non_module_dependencies} shape as collect_database,
+    but from a folder of .sql files instead of a live DB - schema/name/type come from each
+    file's own CREATE/ALTER header. Computed columns, constraints and encrypted objects aren't
+    representable this way, so non_module_dependencies is always empty."""
+    opts = cfg["options"]
+    include = {x.upper() for x in opts["include_object_types"]}
+    excl_schemas = {x.casefold() for x in opts["exclude_schemas"]}
+    excl_objects = {"{}.{}".format(*split_name(x)).casefold() for x in opts["exclude_objects"]}
+
+    targets = []
+    scope_display = {}
+    for entry in scope:
+        sch, nm = split_name(entry)
+        m = mapping_for(entry, cfg)
+        src_type = m.get("source_type")
+        synonyms = [list(x) for x in m.get("source_synonyms", [])]
+        targets.append({
+            "schema": sch, "name": nm, "found": True, "object_id": None,
+            "type": src_type or "?", "type_desc": CLR_TYPE_DESC.get(src_type, ""),
+            "is_clr": True, "assembly": None, "assembly_class": None, "assembly_method": None,
+            "permission_set": None, "param_count": m.get("source_param_count"),
+            "signature": None, "synonyms": synonyms})
+        scope_display[f"{sch}.{nm}".casefold()] = f"{sch}.{nm}"
+        for syn_sch, syn_nm in synonyms:
+            scope_display[f"{syn_sch}.{syn_nm}".casefold()] = f"{sch}.{nm}"
+        if not src_type:
+            log.warning("[%s] %s.%s has no source_type in config clr_objects - unqualified calls "
+                        "to it (bare EXEC of a procedure, or an unschema-qualified table-valued "
+                        "function) won't be detected; schema-qualified calls are unaffected", db, sch, nm)
+
+    objects = []
+    oid = 1
+    files = sorted(folder.rglob("*.sql"))
+    if not files:
+        log.warning("[%s] no .sql files found under %s", db, folder)
+    for path in files:
+        raw = read_sql(path)
+        ansi, qi = sniff_settings(raw)
+        toks, _ = tokenize(raw, qi)
+        sig = significant(toks)
+        create_at = find_create_offset(sig)
+        if create_at is None:
+            log.warning("[%s] %s: no CREATE/ALTER PROC/FUNCTION/VIEW/TRIGGER header found - skipped",
+                        db, path)
+            continue
+        # trimmed to start exactly at CREATE/ALTER, matching sys.sql_modules.definition's shape -
+        # SET ANSI_NULLS/QUOTED_IDENTIFIER/GO preamble is captured structurally above, not textually
+        text = trim_trailing_go(raw[create_at:])
+        toks2, _ = tokenize(text, qi)
+        sig = significant(toks2)
+        header = parse_header(sig)
+        typ = header_object_type(sig, header)
+        if typ not in include:
+            log.info("[%s] %s: type %s excluded by options.include_object_types - skipped", db, path, typ)
+            continue
+        parts = header.name_parts
+        sch = parts[-2] if len(parts) >= 2 and parts[-2] else "dbo"
+        nm = parts[-1]
+        full = f"{sch}.{nm}"
+        if sch.casefold() in excl_schemas or full.casefold() in excl_objects:
+            log.info("[%s] %s: excluded by options - skipped", db, full)
+            continue
+        hit_targets = sorted({scope_display[f"{s}.{n}"] for s, n in referenced_names(text, qi)
+                              if f"{s}.{n}" in scope_display})
+        if not hit_targets:
+            log.info("[%s] %s: no reference to the scoped CLR object(s) found - included anyway "
+                     "(explicit folder input)", db, full)
+        base = f"{safe_filename(sch)}.{safe_filename(nm)}"
+        rel = Path("definitions") / safe_filename(db) / typ / f"{base}.sql"
+        if str(rel).casefold() in used:  # case-insensitive filesystems (Windows)
+            rel = rel.with_name(f"{base}__{oid}.sql")
+        used.add(str(rel).casefold())
+        write_text(run_dir / rel, text)
+        objects.append({
+            "object_id": oid, "schema": sch, "name": nm, "type": typ, "type_desc": typ,
+            "uses_ansi_nulls": ansi, "uses_quoted_identifier": qi, "is_schema_bound": False,
+            "is_encrypted": False,
+            "modify_date": dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat(),
+            "discovered_by": ["folder_scan"], "targets": hit_targets,
+            "definition_path": rel.as_posix(), "sha256": sha256_text(text)})
+        oid += 1
+    objects.sort(key=lambda o: (o["type"], o["schema"].casefold(), o["name"].casefold()))
+    log.info("[%s] %d object(s) ingested from folder", db, len(objects))
+    return {"targets": targets, "objects": objects, "non_module_dependencies": []}
+
+
 # ------------------------------------------------------------------ analysis
 def analyze_and_report(run_dir: Path, inv: dict, cfg: dict) -> dict:
     inv_dir = run_dir / "inventory"
@@ -409,6 +580,9 @@ def main() -> int:
     ap.add_argument("--database", action="append", help="Limit to these source databases")
     ap.add_argument("--reanalyze", metavar="RUN_DIR",
                     help="Re-run analysis/suggestions on an existing run folder (no DB connection)")
+    ap.add_argument("--from-folder", metavar="DIR",
+                    help="Build a run folder from a folder of .sql definitions instead of a live DB "
+                         "scan (offline, no DB); requires exactly one --database")
     args = ap.parse_args()
 
     try:
@@ -423,6 +597,35 @@ def main() -> int:
         inv = json.loads((run_dir / "inventory" / "inventory.json").read_text(encoding="utf-8"))
         s = analyze_and_report(run_dir, inv, cfg)
         log.info("Re-analysis complete: %s", json.dumps(s["objects_by_complexity"]))
+        return 0
+
+    if args.from_folder:
+        folder = Path(args.from_folder)
+        if not folder.is_dir():
+            print(f"Not a folder: {folder}", file=sys.stderr)
+            return 2
+        if not args.database or len(args.database) != 1:
+            print("CONFIG ERROR: --from-folder requires exactly one --database NAME", file=sys.stderr)
+            return 2
+        db = args.database[0]
+        scope = resolve_scope(args, cfg)
+        run_id = f"{safe_filename(cfg['project'])}_{stamp()}"
+        run_dir = resolve_path(cfg, cfg["output_root"]) / run_id
+        setup_logging(run_dir / "logs", "phase1_from_folder")
+        log.info("Run %s | CLR scope: %s | folder: %s", run_id, ", ".join(scope), folder)
+        inv = {"tool_version": __version__, "run_id": run_id, "created_utc": utc_now().isoformat(),
+               "config_path": cfg["_path"], "config_sha256": cfg["_sha256"],
+               "source_server": f"offline-folder:{folder}", "auth_method": "n/a",
+               "auth_client_id": "n/a", "runtime": runtime_identity(),
+               "clr_scope": scope, "databases": {}}
+        used: set = set()
+        inv["databases"][db] = collect_from_folder(folder, db, scope, cfg, run_dir, used)
+        reporting.write_json(run_dir / "inventory" / "inventory.json", inv)
+        s = analyze_and_report(run_dir, inv, cfg)
+        log.info("Folder inventory complete -> %s", run_dir)
+        log.info("Objects: %d | actionable sites: %d | auto-convertible: %d | by complexity: %s",
+                 s["impacted_objects"], s["actionable_sites"], s["auto_convertible_sites"],
+                 json.dumps(s["objects_by_complexity"]))
         return 0
 
     from clr_migrator.db import connect_source, source_identity

@@ -1,0 +1,18 @@
+project: OFFLINE_SAMPLE
+output_root: ./output
+source:
+  server: not-used-in-from-folder-mode
+  databases: [RETAILDB]
+  auth: {method: service_principal_secret, tenant_id_env: AZURE_TENANT_ID, client_id_env: AZURE_CLIENT_ID, client_secret_env: AZURE_CLIENT_SECRET}
+target:
+  platform: aws_rds_sqlserver
+  engine_major_version: 15
+  compat_level: 150
+prerequisite_scripts:
+  - wrapper/01_fn_ToTitleCase.sql
+clr_objects:
+  - name: dbo.clr_ToTitleCase
+    strategy: rename
+    replacement_object: dbo.fn_ToTitleCase
+    source_type: FS
+    source_param_count: 1
