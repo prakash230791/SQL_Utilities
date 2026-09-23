@@ -1,0 +1,28 @@
+project: DEMO
+output_root: ./output
+source:
+  server: demo-mi.public.xxxx.database.windows.net
+  port: 3342
+  databases: [VZQE]
+  auth: {method: service_principal_secret, tenant_id_env: AZURE_TENANT_ID, client_id_env: AZURE_CLIENT_ID, client_secret_env: AZURE_CLIENT_SECRET}
+target:
+  platform: aws_rds_sqlserver
+  engine_major_version: 15
+  compat_level: 150
+  required_types: [dbo.ConcatValueList]
+prerequisite_scripts:
+  - prereqs/01_ConcatValueList_type.sql
+  - prereqs/02_replacement_functions.sql
+clr_objects:
+  - name: dbo.Get_concatenate
+    strategy: string_agg
+    replacement_object: dbo.fn_Get_Concatenate
+    tvp_type: dbo.ConcatValueList
+    string_agg: {delimiter: ",", cast_to_nvarchar_max: true, empty_result: empty_string, within_group_order_by: null}
+  - name: dbo.clr_RegexIsMatch
+    strategy: template
+    call_template: "dbo.fn_RegexIsMatch({0}, {1}, 0)"
+    expected_arg_count: 2
+  - name: dbo.clr_SplitString
+    strategy: rename
+    replacement_object: dbo.fn_SplitString
