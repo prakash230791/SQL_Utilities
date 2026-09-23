@@ -26,7 +26,11 @@ Usage:
 folder of proc/function/view/trigger .sql files instead of scanning a live database: schema,
 name and object type are read off each file's own CREATE/ALTER header (RETURNS decides FN vs
 IF vs TF), and ANSI_NULLS/QUOTED_IDENTIFIER are sniffed from any SET statements in the file
-(default ON/ON). Give the source CLR its type/arity up front with source_type/source_param_count
+(default ON/ON). Files scripted out of SSMS ("Script as CREATE") are handled directly: a leading
+SET ANSI_NULLS/QUOTED_IDENTIFIER/GO preamble and a trailing GO are trimmed so the stored
+definition matches sys.sql_modules.definition's own shape - the settings aren't lost, they're
+captured in uses_ansi_nulls/uses_quoted_identifier instead, same as a live run.
+Give the source CLR its type/arity up front with source_type/source_param_count
 on its clr_objects entry in config - without it, unqualified calls to a CLR procedure or
 table-valued function may go undetected (schema-qualified calls, the normal case, are unaffected). Add
 source_synonyms: [[schema, name], ...] for any synonym that points at it (there's no catalog to
@@ -273,6 +277,7 @@ def collect_database(cur, db: str, scope: list[str], cfg: dict, run_dir: Path, u
 
 # ------------------------------------------------------ folder collection (offline, no DB)
 _SET_RX = re.compile(r"\bSET\s+(ANSI_NULLS|QUOTED_IDENTIFIER)\s+(ON|OFF)\b", re.IGNORECASE)
+_TRAILING_GO_RX = re.compile(r"\r?\n[ \t]*GO[ \t]*(?:\r?\n)*\Z", re.IGNORECASE)
 _HDR_TYPE = {"PROC": "P", "PROCEDURE": "P", "VIEW": "V", "TRIGGER": "TR"}
 
 
@@ -287,6 +292,24 @@ def sniff_settings(text: str) -> tuple[bool, bool]:
         else:
             qi = val
     return ansi, qi
+
+
+def find_create_offset(sig: list[Token]) -> int | None:
+    """The character offset of the object's own CREATE/ALTER PROC/FUNCTION/VIEW/TRIGGER header,
+    skipping any leading SET ANSI_NULLS/QUOTED_IDENTIFIER/GO preamble a scripted-out file carries.
+    parse_header alone only recognizes a header at token 0, which sys.sql_modules.definition
+    always satisfies (SQL Server strips the SET statements into their own catalog columns) but a
+    file scripted out of SSMS normally does not."""
+    for i, t in enumerate(sig):
+        if t.upper in ("CREATE", "ALTER") and parse_header(sig[i:]) is not None:
+            return t.start
+    return None
+
+
+def trim_trailing_go(text: str) -> str:
+    """Drops one trailing standalone GO batch separator, matching sys.sql_modules.definition's
+    shape (it never has a trailing GO either - GO is a client-tool batch separator, not T-SQL)."""
+    return _TRAILING_GO_RX.sub("", text)
 
 
 def detect_function_subtype(sig: list[Token], name_end: int) -> str:
@@ -350,15 +373,21 @@ def collect_from_folder(folder: Path, db: str, scope: list[str], cfg: dict, run_
     if not files:
         log.warning("[%s] no .sql files found under %s", db, folder)
     for path in files:
-        text = read_sql(path)
-        ansi, qi = sniff_settings(text)
-        toks, _ = tokenize(text, qi)
+        raw = read_sql(path)
+        ansi, qi = sniff_settings(raw)
+        toks, _ = tokenize(raw, qi)
         sig = significant(toks)
-        header = parse_header(sig)
-        if header is None:
+        create_at = find_create_offset(sig)
+        if create_at is None:
             log.warning("[%s] %s: no CREATE/ALTER PROC/FUNCTION/VIEW/TRIGGER header found - skipped",
                         db, path)
             continue
+        # trimmed to start exactly at CREATE/ALTER, matching sys.sql_modules.definition's shape -
+        # SET ANSI_NULLS/QUOTED_IDENTIFIER/GO preamble is captured structurally above, not textually
+        text = trim_trailing_go(raw[create_at:])
+        toks2, _ = tokenize(text, qi)
+        sig = significant(toks2)
+        header = parse_header(sig)
         typ = header_object_type(sig, header)
         if typ not in include:
             log.info("[%s] %s: type %s excluded by options.include_object_types - skipped", db, path, typ)
