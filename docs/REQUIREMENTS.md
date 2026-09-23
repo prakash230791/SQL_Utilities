@@ -5,7 +5,7 @@
 | Document version | 1.0 (2026-09-22) |
 | Owner | Prakash (Data/Solutions Architect) |
 | Code version at hand-off | `clr_migrator` 1.0.0 — core engine written and demo-verified; hardening, tests and docs outstanding |
-| Source platform | Azure SQL Managed Instance (database `VZQE` and others) |
+| Source platform | Azure SQL Managed Instance (database `SAMPLEDB` and others) |
 | Target platform | Amazon RDS for SQL Server (2019 / 2022 expected) |
 | Implementation agent | Claude Code (Sonnet) — see §0 |
 
@@ -39,7 +39,7 @@ The estate is migrating from Azure SQL MI to Amazon RDS for SQL Server. SQL CLR 
 | Name + signature | `dbo.clr_RegexIsMatch(a,b)` → `dbo.fn_RegexIsMatch(a,b,0)` | Full (template) |
 | Query rewrite | CLR aggregate `dbo.Get_concatenate(x)` → `STRING_AGG(...)` | Full for standard shapes; manual for corner cases |
 
-The reference CLR is `dbo.Get_concatenate`, a user-defined aggregate: C# struct `getConcatenate`, `Format.UserDefined`, `MaxByteSize=-1`, comma delimiter, returns `NVARCHAR(MAX)`. Its replacements already exist in the repo (`CRMM/CLRs`):
+The reference CLR is `dbo.Get_concatenate`, a user-defined aggregate: C# struct `getConcatenate`, `Format.UserDefined`, `MaxByteSize=-1`, comma delimiter, returns `NVARCHAR(MAX)`. Its replacements already exist in the repo (`demo/prereqs/`):
 - `01_ConcatValueList_type.sql` — TVP type `dbo.ConcatValueList (Val NVARCHAR(MAX))`
 - `02_fn_Get_Concatenate.sql` — wrapper `dbo.fn_Get_Concatenate(@Values ConcatValueList READONLY, @Delimiter NVARCHAR(10) = ',')` using `STRING_AGG`
 
@@ -257,7 +257,7 @@ Validation rules (already implemented; keep them): duplicate names rejected; ren
 | V-VERIFY (object) | Catalog dependency, no actionable site | — | Human inspection |
 | C-ENCRYPTED (object) | No definition | — | Get source from source control |
 
-A same-database three-part name (`VZQE.dbo.x` while inventorying VZQE) is auto-converted; the DB qualifier is dropped and noted in the audit.
+A same-database three-part name (`SAMPLEDB.dbo.x` while inventorying SAMPLEDB) is auto-converted; the DB qualifier is dropped and noted in the audit.
 
 ## 9. Phase 2 — functional requirements
 
@@ -434,7 +434,7 @@ A SQL login with `db_ddladmin` (or `db_owner`) on a **non-production** RDS datab
 
 | Task | Scope | Files | DoD |
 |---|---|---|---|
-| **T01** Packaging | `requirements.txt` (runtime), `requirements-dev.txt` (pytest, ruff), `pyproject.toml` (ruff config, py310), `.gitignore` (`output/`, `demo/output/`, `__pycache__`, `.venv`), `config.example.yaml` fully commented per §6 with the three VZQE mappings | root | `pip install -r requirements.txt` works; config.example loads with `load_config` |
+| **T01** Packaging | `requirements.txt` (runtime), `requirements-dev.txt` (pytest, ruff), `pyproject.toml` (ruff config, py310), `.gitignore` (`output/`, `demo/output/`, `__pycache__`, `.venv`), `config.example.yaml` fully commented per §6 with the three SAMPLEDB mappings | root | `pip install -r requirements.txt` works; config.example loads with `load_config` |
 | **T02** Unit tests | All §14.1 cases | `tests/test_lexer.py`, `test_analyzer.py`, `test_rewriter.py`, `test_validators.py`, `test_config.py` | `pytest -q` green; no production code change unless a test exposes a real bug (document it) |
 | **T03** Golden test | §14.2 | `tests/test_demo_golden.py`, `tests/golden/` | Green; regenerating goldens is a documented script flag |
 | **T04** Phase 1 self-test | `phase1_inventory.py --self-test`: connect per DB, print `SUSER_SNAME()`, `DB_NAME()`, `@@VERSION`, `HAS_PERMS_BY_NAME(DB_NAME(),'DATABASE','VIEW DEFINITION')`; exit non-zero on failure | phase1 | Fails fast with an actionable message when the SP user or grant is missing |
@@ -465,7 +465,7 @@ A SQL login with `db_ddladmin` (or `db_owner`) on a **non-production** RDS datab
 - Dynamic SQL is only detected, never rewritten. Runtime-generated SQL can be missed entirely if the name is assembled from fragments (e.g. `'Get_' + 'concatenate'`).
 - DDL triggers (database scope) are not in `sys.objects` and are excluded.
 - Live compile rolls back per object, so each object compiles against the target's *existing* state, not against other converted objects. Deferred name resolution means procedures referencing missing tables still compile.
-- Prerequisite scripts containing `USE [VZQE]` will switch database even when `database_map` renames the target. Keep prerequisite scripts free of `USE`, or align the names.
+- Prerequisite scripts containing `USE [SAMPLEDB]` will switch database even when `database_map` renames the target. Keep prerequisite scripts free of `USE`, or align the names.
 - **Behavioral differences to test in Phase 3 (data parity):**
   - **NULLs:** STRING_AGG skips NULLs. The CLR `Accumulate` reads `Value.Value` *before* its `IsNull` check, so a NULL reaching it throws.
   - **Empty input:** CLR returns `''`, STRING_AGG returns NULL. This is handled by INV-1. Note that `dbo.fn_Get_Concatenate` as currently written returns NULL for an empty TVP.

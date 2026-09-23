@@ -120,7 +120,7 @@ def main():
     objects = []
     for n, ((sch, name, typ), body) in enumerate(DEFS.items(), start=1000):
         text = body.strip("\n").replace("\n", CRLF) + CRLF
-        rel = Path("definitions") / "VZQE" / typ / f"{sch}.{name}.sql"
+        rel = Path("definitions") / "SAMPLEDB" / typ / f"{sch}.{name}.sql"
         write_text(RUN / rel, text)
         objects.append({"object_id": n, "schema": sch, "name": name, "type": typ, "type_desc": typ,
                         "uses_ansi_nulls": True, "uses_quoted_identifier": True,
@@ -142,7 +142,7 @@ def main():
            "config_sha256": "demo", "source_server": "demo-mi.public.xxxx.database.windows.net",
            "auth_method": "service_principal_secret", "auth_client_id": "00000000-demo",
            "clr_scope": [t["schema"] + "." + t["name"] for t in TARGETS],
-           "databases": {"VZQE": {"targets": TARGETS, "objects": objects, "non_module_dependencies": nonmod}}}
+           "databases": {"SAMPLEDB": {"targets": TARGETS, "objects": objects, "non_module_dependencies": nonmod}}}
     (RUN / "inventory").mkdir(parents=True, exist_ok=True)
     (RUN / "inventory" / "inventory.json").write_text(json.dumps(inv, indent=2), encoding="utf-8")
     print(f"Demo run written to {RUN}")
