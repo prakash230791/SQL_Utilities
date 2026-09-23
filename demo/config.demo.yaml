@@ -3,7 +3,7 @@ output_root: ./output
 source:
   server: demo-mi.public.xxxx.database.windows.net
   port: 3342
-  databases: [VZQE]
+  databases: [SAMPLEDB]
   auth: {method: service_principal_secret, tenant_id_env: AZURE_TENANT_ID, client_id_env: AZURE_CLIENT_ID, client_secret_env: AZURE_CLIENT_SECRET}
 target:
   platform: aws_rds_sqlserver
