@@ -1,0 +1,5 @@
+pyodbc>=5.0
+azure-identity>=1.15
+PyYAML>=6.0
+# optional: AWS Secrets Manager for RDS live validation
+boto3>=1.28
