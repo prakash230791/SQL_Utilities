@@ -196,8 +196,27 @@ One YAML file drives both phases. Secrets **never** appear in it — only the *n
 | `string_agg.cast_to_nvarchar_max` | string_agg | Default true (see INV-2) |
 | `string_agg.empty_result` | string_agg | `empty_string` (default, CLR parity) \| `null` |
 | `string_agg.within_group_order_by` | string_agg | e.g. `"{0}"` or `"{0} DESC"`; null = unordered |
+| `source_type` | `phase1_inventory.py --from-folder` only | CLR type code (`AF`\|`FS`\|`FT`\|`PC`\|`TA`); ignored on a live run, which reads it from the catalog. Without it, unqualified calls to a CLR procedure or table-valued function may go undetected (schema-qualified calls are unaffected) |
+| `source_param_count` | `--from-folder` only | Parameter count, for the arity checks a live run gets from the catalog |
+| `source_synonyms` | `--from-folder` only | `[[schema, name], ...]` for any synonym pointing at this CLR; there's no catalog to discover synonyms from offline |
 
-Validation rules (already implemented; keep them): duplicate names rejected; rename requires `replacement_object`; template requires `call_template`; enum values checked; `source.databases` must be a list.
+Validation rules (already implemented; keep them): duplicate names rejected; rename requires `replacement_object`; template requires `call_template`; enum values checked; `source.databases` must be a list; `source_type` (when given) must be a known CLR type code; `source_param_count` (when given) must be an integer; `source_synonyms` entries must be `[schema, name]` pairs.
+
+### 6.1 Offline folder intake (`phase1_inventory.py --from-folder`)
+
+Bridges "I have the impacted procs as files, not a live database" straight into Phase 2, with **no code change to Phase 2** — it only ever reads `schema`/`name`/`type`/`definition_path`/`sha256`/`uses_ansi_nulls`/`uses_quoted_identifier` off `inventory.json` and re-analyzes the SQL itself.
+
+```bash
+python phase1_inventory.py --config config.yaml --from-folder impacted_procs \
+    --clr dbo.Get_concatenate --database SAMPLEDB
+python phase2_convert.py    --config config.yaml --inventory output/<run_id>
+```
+
+For every `.sql` file under the given folder: schema, name and object type (`P`/`FN`/`IF`/`TF`/`V`/`TR`) are read off its own `CREATE`/`ALTER` header with the tokenizer (no SQL-parser dependency, per §16 rule 8) — the `RETURNS` clause distinguishes a scalar function from an inline vs. multi-statement table-valued function. `ANSI_NULLS`/`QUOTED_IDENTIFIER` are sniffed from any `SET` statements in the file, defaulting ON/ON. The source CLR's type/arity/synonyms come from `source_type`/`source_param_count`/`source_synonyms` on its `clr_objects` entry (§6), since there's no catalog to read them from.
+
+Known limitations, inherent to having no database connection — use a live Phase 1 run when they matter:
+- Computed columns, constraints and encrypted objects aren't representable as files and are skipped.
+- An object renamed with `sp_rename` after the file was last extracted is invisible: the file's own `CREATE` header name is trusted as current, so the stale-header fix (HDR-NAME-FIX / V07) never triggers.
 
 ## 7. Phase 1 — functional requirements
 

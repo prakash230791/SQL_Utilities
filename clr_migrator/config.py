@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .analyzer import CLR_TYPE_DESC
+
 
 class ConfigError(Exception):
     pass
@@ -87,6 +89,9 @@ def _defaults(cfg: dict) -> None:
 
     for c in cfg["clr_objects"]:
         c.setdefault("strategy", "manual")
+        c.setdefault("source_type", None)
+        c.setdefault("source_param_count", None)
+        c.setdefault("source_synonyms", [])
         if c["strategy"] == "string_agg":
             sa = c.setdefault("string_agg", {})
             sa.setdefault("delimiter", ",")
@@ -125,3 +130,10 @@ def _validate(cfg: dict) -> None:
             raise ConfigError(f"clr_objects[{i}] strategy template requires call_template")
         if s == "string_agg" and c["string_agg"]["empty_result"] not in ("empty_string", "null"):
             raise ConfigError(f"clr_objects[{i}].string_agg.empty_result must be empty_string or null")
+        if c["source_type"] is not None and c["source_type"] not in CLR_TYPE_DESC:
+            raise ConfigError(f"clr_objects[{i}].source_type must be one of {sorted(CLR_TYPE_DESC)} or omitted")
+        if c["source_param_count"] is not None and not isinstance(c["source_param_count"], int):
+            raise ConfigError(f"clr_objects[{i}].source_param_count must be an integer or omitted")
+        for syn in c["source_synonyms"]:
+            if not (isinstance(syn, list) and len(syn) == 2):
+                raise ConfigError(f"clr_objects[{i}].source_synonyms entries must be [schema, name] pairs")
